@@ -10,9 +10,10 @@
 # Применены лучшие практики;
 
 require 'json'
-require 'pry'
 require 'date'
 require 'minitest/autorun'
+require 'set'
+require 'singleton'
 
 class User
   attr_reader :attributes, :sessions
@@ -23,24 +24,127 @@ class User
   end
 end
 
-def parse_user(user)
-  fields = user.split(',')
-  parsed_result = {
-    'id' => fields[1],
-    'first_name' => fields[2],
-    'last_name' => fields[3],
-    'age' => fields[4],
+class Reporter
+  include Singleton
+
+  def generate(source_path, target_path)
+    reset
+
+    File.open(source_path).each do |line|
+      cols = line.split(',').map(&:strip)
+      kind = cols.shift
+      process_user(cols) if kind == 'user'
+      process_session(cols) if kind == 'session'
+    end
+
+    enrich
+    write_directly(target_path)
+  end
+
+  private
+
+  def reset
+    @report = {
+      'totalUsers' => 0,
+      'uniqueBrowsersCount' => 0,
+      'totalSessions' => 0,
+      'allBrowsers' => Set.new,
+      'usersStats' => {}
+    }
+  end
+
+  def process_user(fields)
+    if @report['usersStats'].has_key?(fields[0])
+      @report['usersStats'][fields[0]]['name'] = "#{fields[1]} #{fields[2]}",
+      @report['usersStats'][fields[0]]['age'] = fields[3]
+    else
+      @report['usersStats'][fields[0]] = {
+        'name' => "#{fields[1]} #{fields[2]}",
+        'age' => fields[3]
+      }
+      @report['totalUsers'] += 1
+    end
+  end
+
+  def process_session(fields)
+    user_id = fields[0]
+    browser = fields[2].upcase
+    duration = fields[3].to_i
+    date = Date.parse(fields[4])
+
+    @report['totalSessions'] += 1
+    @report['allBrowsers'].add(browser)
+
+    if @report['usersStats'].has_key?(user_id)
+      @report['usersStats'][user_id]['sessionsCount'] ||= 0
+      @report['usersStats'][user_id]['sessionsCount'] += 1
+      @report['usersStats'][user_id]['browsers'] ||= Set.new
+      @report['usersStats'][user_id]['browsers'].add(browser)
+      @report['usersStats'][user_id]['usedIE'] = false if @report['usersStats'][user_id]['usedIE'].nil?
+      @report['usersStats'][user_id]['usedIE'] = !!(browser =~ /INTERNET EXPLORER/) unless @report['usersStats'][user_id]['usedIE']
+      if @report['usersStats'][user_id]['alwaysUsedChrome'].nil? || @report['usersStats'][user_id]['alwaysUsedChrome']
+        @report['usersStats'][user_id]['alwaysUsedChrome'] = !!(browser =~ /CHROME/)
+      end
+      @report['usersStats'][user_id]['totalTime'] ||= 0
+      @report['usersStats'][user_id]['totalTime'] += duration
+      @report['usersStats'][user_id]['longestSession'] ||= 0
+      @report['usersStats'][user_id]['longestSession'] = [@report['usersStats'][user_id]['longestSession'], duration].max
+      @report['usersStats'][user_id]['dates'] ||= Set.new
+      @report['usersStats'][user_id]['dates'].add(date)
+    else
+      @report['usersStats'][user_id] = {
+        'sessionsCount' => 1,
+        'browsers' => Set.new.tap { |s| s.add(browser) },
+        'usedIE' => !!(browser =~ /INTERNET EXPLORER/),
+        'alwaysUsedChrome' => !!(browser =~ /CHROME/),
+        'totalTime' => duration,
+        'longestSession' => duration,
+        'dates' => Set.new.tap { |s| s.add(date) }
+      }
+    end
+  end
+
+  def enrich
+    @report['uniqueBrowsersCount'] = @report['allBrowsers'].size
+    @report['allBrowsers'] = @report['allBrowsers'].to_a.sort.join(',')
+    @report['usersStats'].keys.each do |user_id|
+      @report['usersStats'][user_id]['dates'] =
+        @report['usersStats'][user_id]['dates'].to_a.sort { |a, b| b <=> a }.map(&:iso8601).join(',')
+      @report['usersStats'][user_id]['browsers'] =
+        @report['usersStats'][user_id]['browsers'].to_a.sort.join(',')
+      @report['usersStats'][user_id]['totalTime'] =
+        "#{@report['usersStats'][user_id]['totalTime']} min."
+      @report['usersStats'][user_id]['longestSession'] =
+        "#{@report['usersStats'][user_id]['longestSession']} min."
+    end
+  end
+  
+  def write_directly(target_path)
+    @report['usersStats'].keys.each do |user_id|
+      name = @report['usersStats'][user_id].delete('name')
+      @report['usersStats'][name] = @report['usersStats'].delete(user_id)
+    end
+
+    File.write(target_path, "#{@report.to_json}\n")
+  end
+end
+
+def parse_user(fields)
+  {
+    'id' => fields[0],
+    'first_name' => fields[1],
+    'last_name' => fields[2],
+    'age' => fields[3],
   }
 end
 
-def parse_session(session)
-  fields = session.split(',')
-  parsed_result = {
-    'user_id' => fields[1],
-    'session_id' => fields[2],
-    'browser' => fields[3],
-    'time' => fields[4],
-    'date' => fields[5],
+def parse_session(fields)
+  {
+    'user_id' => fields[0],
+    'session_id' => fields[1],
+    'browser' => fields[2],
+    'time' => fields[3],
+    'date' => fields[4],
   }
 end
 
@@ -52,16 +156,15 @@ def collect_stats_from_users(report, users_objects, &block)
   end
 end
 
-def work
-  file_lines = File.read('data.txt').split("\n")
-
+def work(file_path)
   users = []
   sessions = []
 
-  file_lines.each do |line|
-    cols = line.split(',')
-    users = users + [parse_user(line)] if cols[0] == 'user'
-    sessions = sessions + [parse_session(line)] if cols[0] == 'session'
+  File.open(file_path).each do |line|
+    cols = line.strip.split(',').map(&:strip)
+    kind = cols.shift
+    users = users + [parse_user(cols)] if kind == 'user'
+    sessions = sessions + [parse_session(cols)] if kind == 'session'
   end
 
   # Отчёт в json
@@ -149,12 +252,11 @@ def work
     { 'dates' => user.sessions.map{|s| s['date']}.map {|d| Date.parse(d)}.sort.reverse.map { |d| d.iso8601 } }
   end
 
-  File.write('result.json', "#{report.to_json}\n")
+  File.write('result_old.json', "#{report.to_json}\n")
 end
 
 class TestMe < Minitest::Test
   def setup
-    File.write('result.json', '')
     File.write('data.txt',
 'user,0,Leida,Cira,0
 session,0,0,Safari 29,87,2016-10-23
@@ -177,9 +279,31 @@ session,2,3,Chrome 20,84,2016-11-25
 ')
   end
 
-  def test_result
-    work
+  def test_old_result
+    File.truncate('result_old.json', 0) if File.exist?('result_old.json')
+
+    work('data.txt')
+
     expected_result = '{"totalUsers":3,"uniqueBrowsersCount":14,"totalSessions":15,"allBrowsers":"CHROME 13,CHROME 20,CHROME 35,CHROME 6,FIREFOX 12,FIREFOX 32,FIREFOX 47,INTERNET EXPLORER 10,INTERNET EXPLORER 28,INTERNET EXPLORER 35,SAFARI 17,SAFARI 29,SAFARI 39,SAFARI 49","usersStats":{"Leida Cira":{"sessionsCount":6,"totalTime":"455 min.","longestSession":"118 min.","browsers":"FIREFOX 12, INTERNET EXPLORER 28, INTERNET EXPLORER 28, INTERNET EXPLORER 35, SAFARI 29, SAFARI 39","usedIE":true,"alwaysUsedChrome":false,"dates":["2017-09-27","2017-03-28","2017-02-27","2016-10-23","2016-09-15","2016-09-01"]},"Palmer Katrina":{"sessionsCount":5,"totalTime":"218 min.","longestSession":"116 min.","browsers":"CHROME 13, CHROME 6, FIREFOX 32, INTERNET EXPLORER 10, SAFARI 17","usedIE":true,"alwaysUsedChrome":false,"dates":["2017-04-29","2016-12-28","2016-12-20","2016-11-11","2016-10-21"]},"Gregory Santos":{"sessionsCount":4,"totalTime":"192 min.","longestSession":"85 min.","browsers":"CHROME 20, CHROME 35, FIREFOX 47, SAFARI 49","usedIE":false,"alwaysUsedChrome":false,"dates":["2018-09-21","2018-02-02","2017-05-22","2016-11-25"]}}}' + "\n"
-    assert_equal expected_result, File.read('result.json')
+    assert_equal expected_result, File.read('result_old.json')
+  end
+
+  def test_new_result
+    File.truncate('result_new.json', 0) if File.exist?('result_new.json')
+
+    Reporter.instance.generate('data.txt', 'result_new.json')
+
+    expected_result = '{"totalUsers":3,"uniqueBrowsersCount":14,"totalSessions":15,"allBrowsers":"CHROME 13,CHROME 20,CHROME 35,CHROME 6,FIREFOX 12,FIREFOX 32,FIREFOX 47,INTERNET EXPLORER 10,INTERNET EXPLORER 28,INTERNET EXPLORER 35,SAFARI 17,SAFARI 29,SAFARI 39,SAFARI 49","usersStats":{"Leida Cira":{"age":"0","sessionsCount":6,"browsers":"FIREFOX 12,INTERNET EXPLORER 28,INTERNET EXPLORER 35,SAFARI 29,SAFARI 39","usedIE":true,"alwaysUsedChrome":false,"totalTime":"455 min.","longestSession":"118 min.","dates":"2017-09-27,2017-03-28,2017-02-27,2016-10-23,2016-09-15,2016-09-01"},"Palmer Katrina":{"age":"65","sessionsCount":5,"browsers":"CHROME 13,CHROME 6,FIREFOX 32,INTERNET EXPLORER 10,SAFARI 17","usedIE":true,"alwaysUsedChrome":false,"totalTime":"218 min.","longestSession":"116 min.","dates":"2017-04-29,2016-12-28,2016-12-20,2016-11-11,2016-10-21"},"Gregory Santos":{"age":"86","sessionsCount":4,"browsers":"CHROME 20,CHROME 35,FIREFOX 47,SAFARI 49","usedIE":false,"alwaysUsedChrome":false,"totalTime":"192 min.","longestSession":"85 min.","dates":"2018-09-21,2018-02-02,2017-05-22,2016-11-25"}}}' + "\n"
+    assert_equal expected_result, File.read('result_new.json')
+  end
+
+  def test_new_large_result
+    File.truncate('result_new_large.json', 0) if File.exist?('result_new_large.json')
+
+    beginning_time = Time.now
+    Reporter.instance.generate('data_large.txt', 'result_new_large.json')
+    end_time = Time.now
+
+    puts "[Test New Large]: Time elapsed #{(end_time - beginning_time)*1000} ms"
   end
 end

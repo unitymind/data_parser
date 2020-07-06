@@ -1,2 +1,6 @@
 .idea/*
 data_large.txt
+data.txt
+result_old.json
+result_new.json
+result_new_large.json
